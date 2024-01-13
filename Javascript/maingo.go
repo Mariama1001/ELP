@@ -7,6 +7,7 @@ import (
 	"image/jpeg"
 	"math"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -55,14 +56,12 @@ func convolve(image [][]float64, kernel [][]float64) [][]float64 {
 
 func main() {
 	// Load an image
-	img, err := loadImage("manypixels.jpg")
+	img, err := loadImage("rasputin.jpeg")
 	if err != nil {
 		fmt.Println("Error loading image:", err)
 		return
 	}
-
 	startTime := time.Now()
-
 	// Convert the image to grayscale if it's a color image
 	if isColorImage(img) {
 		img = convertToGrayscale(img)
@@ -84,9 +83,39 @@ func main() {
 		{1, 2, 1},
 	}
 
-	// Perform convolution for both X and Y directions
-	gradientX := convolve(imageData, sobelX)
-	gradientY := convolve(imageData, sobelY)
+	// Create channels for goroutine communication
+	gradientXCh := make(chan [][]float64, len(imageData))
+	gradientYCh := make(chan [][]float64, len(imageData))
+
+	// Use a wait group to wait for all goroutines to finish
+	var wg sync.WaitGroup
+
+	// Process each column of pixels concurrently
+	for i := range imageData {
+		wg.Add(1)
+		go func(column []float64) {
+			defer wg.Done()
+			gradientXCh <- convolve([][]float64{column}, sobelX)
+			gradientYCh <- convolve([][]float64{column}, sobelY)
+		}(imageData[i])
+	}
+
+	// Close channels when all goroutines are done
+	go func() {
+		wg.Wait()
+		close(gradientXCh)
+		close(gradientYCh)
+	}()
+
+	// Collect and combine results from goroutines
+	var gradientX, gradientY [][]float64
+	for result := range gradientXCh {
+		gradientX = append(gradientX, result...)
+	}
+
+	for result := range gradientYCh {
+		gradientY = append(gradientY, result...)
+	}
 
 	// Combine the results to get the final edge-detected image
 	edges := make([][]float64, len(gradientX))
@@ -94,6 +123,7 @@ func main() {
 		edges[i] = make([]float64, len(gradientX[0]))
 	}
 
+	// Combine the results from each goroutine
 	for i := 0; i < len(gradientX); i++ {
 		for j := 0; j < len(gradientX[0]); j++ {
 			edges[i][j] = math.Sqrt(gradientX[i][j]*gradientX[i][j] + gradientY[i][j]*gradientY[i][j])
@@ -137,6 +167,7 @@ func main() {
 	endTime := time.Now()
 	fmt.Printf("Durée sans goroutines: %s",endTime.Sub(startTime))
 }
+
 
 // loadImage loads an image from file
 func loadImage(filename string) (image.Image, error) {
