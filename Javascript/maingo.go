@@ -11,7 +11,16 @@ import (
 	"time"
 )
 
-func convolve(image [][]float64, kernel [][]float64) [][]float64 {
+
+
+// ConvolveResult represents the result of a convolution operation
+type ConvolveResult struct {
+	Result [][]float64
+	Index  int
+}
+
+// convolveParallel performs convolution using goroutines on each row
+func convolveParallel(image [][]float64, kernel [][]float64) [][]float64 {
 	height := len(image)
 	width := len(image[0])
 	kHeight := len(kernel)
@@ -38,37 +47,68 @@ func convolve(image [][]float64, kernel [][]float64) [][]float64 {
 		result[i] = make([]float64, width)
 	}
 
-	// Perform convolution
+	var wg sync.WaitGroup
+	resultCh := make(chan ConvolveResult, height)
+
+	// Perform convolution using goroutines
 	for i := 0; i < height; i++ {
-		for j := 0; j < width; j++ {
-			sum := 0.0
-			for ii := 0; ii < kHeight; ii++ {
-				for jj := 0; jj < kWidth; jj++ {
-					sum += paddedImage[i+ii][j+jj] * kernel[ii][jj]
+		wg.Add(1)
+		go func(row int) {
+			defer wg.Done()
+
+			startRow := row
+			endRow := row + 1
+
+			for i := startRow; i < endRow; i++ {
+				for j := 0; j < width; j++ {
+					sum := 0.0
+					for ii := 0; ii < kHeight; ii++ {
+						for jj := 0; jj < kWidth; jj++ {
+							sum += paddedImage[i+ii][j+jj] * kernel[ii][jj]
+						}
+					}
+					result[i][j] = sum
 				}
 			}
-			result[i][j] = sum
-		}
+
+			resultCh <- ConvolveResult{Result: result[startRow:endRow], Index: row}
+		}(i)
+	}
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Combine results from goroutines
+	for convResult := range resultCh {
+		startRow := convResult.Index
+		copy(result[startRow], convResult.Result[0])
 	}
 
 	return result
 }
 
+
 func main() {
+
 	// Load an image
-	img, err := loadImage("rasputin.jpeg")
+	img, err := loadImage("manypixels.jpg")
 	if err != nil {
 		fmt.Println("Error loading image:", err)
 		return
 	}
+
 	startTime := time.Now()
+
 	// Convert the image to grayscale if it's a color image
 	if isColorImage(img) {
 		img = convertToGrayscale(img)
 	}
 
 	// Convert the grayscale image to a 2D float64 array
-	imageData := imageToFloat64Array(img)
+	imageData := imageToFloat64ArrayParallel(img)
 
 	// Define the Sobel filter
 	sobelX := [][]float64{
@@ -83,39 +123,9 @@ func main() {
 		{1, 2, 1},
 	}
 
-	// Create channels for goroutine communication
-	gradientXCh := make(chan [][]float64, len(imageData))
-	gradientYCh := make(chan [][]float64, len(imageData))
-
-	// Use a wait group to wait for all goroutines to finish
-	var wg sync.WaitGroup
-
-	// Process each column of pixels concurrently
-	for i := range imageData {
-		wg.Add(1)
-		go func(column []float64) {
-			defer wg.Done()
-			gradientXCh <- convolve([][]float64{column}, sobelX)
-			gradientYCh <- convolve([][]float64{column}, sobelY)
-		}(imageData[i])
-	}
-
-	// Close channels when all goroutines are done
-	go func() {
-		wg.Wait()
-		close(gradientXCh)
-		close(gradientYCh)
-	}()
-
-	// Collect and combine results from goroutines
-	var gradientX, gradientY [][]float64
-	for result := range gradientXCh {
-		gradientX = append(gradientX, result...)
-	}
-
-	for result := range gradientYCh {
-		gradientY = append(gradientY, result...)
-	}
+	// Perform convolution for both X and Y directions using goroutines
+	gradientX := convolveParallel(imageData, sobelX)
+	gradientY := convolveParallel(imageData, sobelY)
 
 	// Combine the results to get the final edge-detected image
 	edges := make([][]float64, len(gradientX))
@@ -123,7 +133,6 @@ func main() {
 		edges[i] = make([]float64, len(gradientX[0]))
 	}
 
-	// Combine the results from each goroutine
 	for i := 0; i < len(gradientX); i++ {
 		for j := 0; j < len(gradientX[0]); j++ {
 			edges[i][j] = math.Sqrt(gradientX[i][j]*gradientX[i][j] + gradientY[i][j]*gradientY[i][j])
@@ -151,7 +160,7 @@ func main() {
 	}
 
 	// Convert the 2D float64 array back to a grayscale image
-	edgeImg := float64ArrayToImage(edges)
+	edgeImg := float64ArrayToImageParallel(edges)
 
 	// Save or display the original and edge-detected images
 	if err := saveImage("original_image.jpg", img); err != nil {
@@ -165,7 +174,7 @@ func main() {
 	}
 
 	endTime := time.Now()
-	fmt.Printf("Durée sans goroutines: %s",endTime.Sub(startTime))
+	fmt.Printf("Duration with goroutines: %s\n", endTime.Sub(startTime))
 }
 
 
@@ -191,57 +200,76 @@ func isColorImage(img image.Image) bool {
 	return a != 0xFFFF
 }
 
-// convertToGrayscale converts a color image to grayscale
+// convertToGrayscale converts a color image to grayscale using goroutines
 func convertToGrayscale(img image.Image) *image.Gray {
 	bounds := img.Bounds()
 	gray := image.NewGray(bounds)
 
+	var wg sync.WaitGroup
+
 	for x := bounds.Min.X; x < bounds.Max.X; x++ {
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			gray.Set(x, y, img.At(x, y))
-		}
+		wg.Add(1)
+		go func(x int) {
+			defer wg.Done()
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				gray.Set(x, y, img.At(x, y))
+			}
+		}(x)
 	}
+
+	wg.Wait()
 
 	return gray
 }
 
-// imageToFloat64Array converts an image to a 2D float64 array
-func imageToFloat64Array(img image.Image) [][]float64 {
+// imageToFloat64Array converts an image to a 2D float64 array using goroutines
+func imageToFloat64ArrayParallel(img image.Image) [][]float64 {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
 
 	imageData := make([][]float64, height)
-	for i := range imageData {
-		imageData[i] = make([]float64, width)
+	var wg sync.WaitGroup
+
+	for y := 0; y < height; y++ {
+		wg.Add(1)
+		go func(y int) {
+			defer wg.Done()
+			imageData[y] = make([]float64, width)
+			for x := 0; x < width; x++ {
+				r, _, _, _ := img.At(x, y).RGBA()
+				imageData[y][x] = float64(r) / 65535.0
+			}
+		}(y)
 	}
 
-	for x := 0; x < width; x++ {
-		for y := 0; y < height; y++ {
-			r, _, _, _ := img.At(x, y).RGBA()
-			imageData[y][x] = float64(r) / 65535.0
-		}
-	}
+	wg.Wait()
 
 	return imageData
 }
 
-// float64ArrayToImage converts a 2D float64 array to a grayscale image
-func float64ArrayToImage(data [][]float64) *image.Gray {
+// float64ArrayToImage converts a 2D float64 array to a grayscale image using goroutines
+func float64ArrayToImageParallel(data [][]float64) *image.Gray {
 	height := len(data)
 	width := len(data[0])
 
 	gray := image.NewGray(image.Rect(0, 0, width, height))
+	var wg sync.WaitGroup
 
 	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			gray.SetGray(x, y, color.Gray{uint8(data[y][x])})
-		}
+		wg.Add(1)
+		go func(y int) {
+			defer wg.Done()
+			for x := 0; x < width; x++ {
+				gray.SetGray(x, y, color.Gray{uint8(data[y][x])})
+			}
+		}(y)
 	}
+
+	wg.Wait()
 
 	return gray
 }
-
 // saveImage saves an image to file
 func saveImage(filename string, img image.Image) error {
 	file, err := os.Create(filename)
