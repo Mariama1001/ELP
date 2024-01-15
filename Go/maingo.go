@@ -9,8 +9,28 @@ import (
 	"os"
 	"sync"
 	"time"
+	"log"
+	"runtime"
 )
 
+// Prepare the image that is going to be treated by the edge detection filter
+func PrepareImage(filename string) (image.Image) {
+	
+	// Load the image
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal("Error loading image:", err)
+	}
+	defer file.Close()
+
+	// Decode the image so it can be treated
+	img, _, err := image.Decode(file)
+	if err != nil {
+		log.Fatal("Error decoding image:", err)
+	}
+
+	return img
+}
 
 
 // ConvolveResult represents the result of a convolution operation
@@ -20,7 +40,7 @@ type ConvolveResult struct {
 }
 
 // convolveParallel performs convolution using goroutines on each row
-func convolveParallel(image [][]float64, kernel [][]float64) [][]float64 {
+func convolveParallel(image [][]float64, kernel [][]float64, numWorkers int) [][]float64 {
 	height := len(image)
 	width := len(image[0])
 	kHeight := len(kernel)
@@ -50,14 +70,22 @@ func convolveParallel(image [][]float64, kernel [][]float64) [][]float64 {
 	var wg sync.WaitGroup
 	resultCh := make(chan ConvolveResult, height)
 
-	// Perform convolution using goroutines
-	for i := 0; i < height; i++ {
+	// Calculate the number of rows each worker should handle
+	rowsPerWorker := height / numWorkers
+
+	// Perform convolution using goroutines on each row
+	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
-		go func(row int) {
+		go func(workerID int) {
 			defer wg.Done()
 
-			startRow := row
-			endRow := row + 1
+			startRow := workerID * rowsPerWorker
+			endRow := startRow + rowsPerWorker
+
+			// The last worker may handle extra rows to cover any remainder
+			if workerID == numWorkers-1 {
+				endRow = height
+			}
 
 			for i := startRow; i < endRow; i++ {
 				for j := 0; j < width; j++ {
@@ -71,8 +99,8 @@ func convolveParallel(image [][]float64, kernel [][]float64) [][]float64 {
 				}
 			}
 
-			resultCh <- ConvolveResult{Result: result[startRow:endRow], Index: row}
-		}(i)
+			resultCh <- ConvolveResult{Result: result[startRow:endRow], Index: workerID}
+		}(w)
 	}
 
 	// Wait for all goroutines to finish
@@ -83,32 +111,27 @@ func convolveParallel(image [][]float64, kernel [][]float64) [][]float64 {
 
 	// Combine results from goroutines
 	for convResult := range resultCh {
-		startRow := convResult.Index
-		copy(result[startRow], convResult.Result[0])
+		startRow := convResult.Index * rowsPerWorker
+		copy(result[startRow:], convResult.Result)
 	}
 
 	return result
 }
 
-
 func main() {
 
-	// Load an image
-	img, err := loadImage("manypixels.jpg")
-	if err != nil {
-		fmt.Println("Error loading image:", err)
-		return
-	}
+	// Loads and decodes the image
+	img := PrepareImage("manypixels.jpg")
 
+	numWorkers := runtime.NumCPU()
+	
 	startTime := time.Now()
 
 	// Convert the image to grayscale if it's a color image
-	if isColorImage(img) {
-		img = convertToGrayscale(img)
-	}
+	img = convertToGrayscale(img,numWorkers)
 
 	// Convert the grayscale image to a 2D float64 array
-	imageData := imageToFloat64ArrayParallel(img)
+	imageData := imageToFloat64ArrayParallel(img,numWorkers)
 
 	// Define the Sobel filter
 	sobelX := [][]float64{
@@ -122,11 +145,12 @@ func main() {
 		{0, 0, 0},
 		{1, 2, 1},
 	}
-
+	
 	// Perform convolution for both X and Y directions using goroutines
-	gradientX := convolveParallel(imageData, sobelX)
-	gradientY := convolveParallel(imageData, sobelY)
+	gradientX := convolveParallel(imageData, sobelX, numWorkers)
+	gradientY := convolveParallel(imageData, sobelY, numWorkers)	
 
+	//startTime := time.Now()
 	// Combine the results to get the final edge-detected image
 	edges := make([][]float64, len(gradientX))
 	for i := range edges {
@@ -158,16 +182,13 @@ func main() {
 			edges[i][j] = 255 * (edges[i][j] - minValue) / (maxValue - minValue)
 		}
 	}
+	//endTime := time.Now()
 
 	// Convert the 2D float64 array back to a grayscale image
-	edgeImg := float64ArrayToImageParallel(edges)
+	edgeImg := float64ArrayToImageParallel(edges,numWorkers)
 
-	// Save or display the original and edge-detected images
-	if err := saveImage("original_image.jpg", img); err != nil {
-		fmt.Println("Error saving original image:", err)
-		return
-	}
 
+	//Save the edge detected image 
 	if err := saveImage("edge_detected_image.jpg", edgeImg); err != nil {
 		fmt.Println("Error saving edge-detected image:", err)
 		return
@@ -178,43 +199,27 @@ func main() {
 }
 
 
-// loadImage loads an image from file
-func loadImage(filename string) (image.Image, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	img, _, err := image.Decode(file)
-	if err != nil {
-		return nil, err
-	}
-
-	return img, nil
-}
-
-// isColorImage checks if an image is in color
-func isColorImage(img image.Image) bool {
-	_, _, _, a := img.At(0, 0).RGBA()
-	return a != 0xFFFF
-}
-
 // convertToGrayscale converts a color image to grayscale using goroutines
-func convertToGrayscale(img image.Image) *image.Gray {
+func convertToGrayscale(img image.Image, numWorkers int) *image.Gray {
 	bounds := img.Bounds()
 	gray := image.NewGray(bounds)
 
 	var wg sync.WaitGroup
+	rowsPerWorker := (bounds.Max.Y - bounds.Min.Y) / numWorkers
 
-	for x := bounds.Min.X; x < bounds.Max.X; x++ {
+	for workerID := 0; workerID < numWorkers; workerID++ {
+		startRow := bounds.Min.Y + workerID*rowsPerWorker
+		endRow := startRow + rowsPerWorker
+
 		wg.Add(1)
-		go func(x int) {
+		go func(startRow, endRow int) {
 			defer wg.Done()
-			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-				gray.Set(x, y, img.At(x, y))
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				for y := startRow; y < endRow && y < bounds.Max.Y; y++ {
+					gray.Set(x, y, img.At(x, y))
+				}
 			}
-		}(x)
+		}(startRow, endRow)
 	}
 
 	wg.Wait()
@@ -222,54 +227,81 @@ func convertToGrayscale(img image.Image) *image.Gray {
 	return gray
 }
 
+
+
 // imageToFloat64Array converts an image to a 2D float64 array using goroutines
-func imageToFloat64ArrayParallel(img image.Image) [][]float64 {
+func imageToFloat64ArrayParallel(img image.Image, numWorkers int) [][]float64 {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
 
 	imageData := make([][]float64, height)
-	var wg sync.WaitGroup
 
-	for y := 0; y < height; y++ {
-		wg.Add(1)
-		go func(y int) {
-			defer wg.Done()
-			imageData[y] = make([]float64, width)
-			for x := 0; x < width; x++ {
-				r, _, _, _ := img.At(x, y).RGBA()
-				imageData[y][x] = float64(r) / 65535.0
+	var wg sync.WaitGroup
+	wg.Add(numWorkers) // Increment the wait group count for each worker
+
+	rowsPerWorker := height / numWorkers
+
+	for i := 0; i < numWorkers; i++ {
+		startRow := i * rowsPerWorker
+		endRow := startRow + rowsPerWorker
+		if i == numWorkers-1 {
+			// Ensure that the last worker processes remaining rows
+			endRow = height
+		}
+
+		go func(startRow, endRow int) {
+			defer wg.Done() // Decrement the wait group count when the goroutine finishes
+
+			for y := startRow; y < endRow; y++ {
+				imageData[y] = make([]float64, width)
+				for x := 0; x < width; x++ {
+					r, _, _, _ := img.At(x, y).RGBA()
+					imageData[y][x] = float64(r) / 65535.0
+				}
 			}
-		}(y)
+		}(startRow, endRow)
 	}
 
-	wg.Wait()
+	wg.Wait() // Wait for all goroutines to finish
 
 	return imageData
 }
 
-// float64ArrayToImage converts a 2D float64 array to a grayscale image using goroutines
-func float64ArrayToImageParallel(data [][]float64) *image.Gray {
+
+func float64ArrayToImageParallel(data [][]float64, numWorkers int) *image.Gray {
 	height := len(data)
 	width := len(data[0])
 
 	gray := image.NewGray(image.Rect(0, 0, width, height))
 	var wg sync.WaitGroup
 
-	for y := 0; y < height; y++ {
+	rowsPerWorker := height / numWorkers
+
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(y int) {
+		startRow := i * rowsPerWorker
+		endRow := startRow + rowsPerWorker
+		if i == numWorkers-1 {
+			// Ensure that the last worker processes remaining rows
+			endRow = height
+		}
+
+		go func(startRow, endRow int) {
 			defer wg.Done()
-			for x := 0; x < width; x++ {
-				gray.SetGray(x, y, color.Gray{uint8(data[y][x])})
+			for y := startRow; y < endRow; y++ {
+				for x := 0; x < width; x++ {
+					gray.SetGray(x, y, color.Gray{uint8(data[y][x])})
+				}
 			}
-		}(y)
+		}(startRow, endRow)
 	}
 
 	wg.Wait()
 
 	return gray
 }
+
 // saveImage saves an image to file
 func saveImage(filename string, img image.Image) error {
 	file, err := os.Create(filename)
