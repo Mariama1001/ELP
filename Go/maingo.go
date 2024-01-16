@@ -39,12 +39,25 @@ type ConvolveResult struct {
 	Index  int
 }
 
+var sobelX = [][]float64{
+	{-1, 0, 1},
+	{-2, 0, 2},
+	{-1, 0, 1},
+}
+
+var sobelY = [][]float64{
+	{-1, -2, -1},
+	{0, 0, 0},
+	{1, 2, 1},
+}
+
 // convolveParallel performs convolution using goroutines on each row
 func convolveParallel(image [][]float64, kernel [][]float64, numWorkers int) [][]float64 {
 	height := len(image)
 	width := len(image[0])
 	kHeight := len(kernel)
 	kWidth := len(kernel[0])
+	
 
 	padHeight := kHeight / 2
 	padWidth := kWidth / 2
@@ -131,20 +144,8 @@ func main() {
 	img = convertToGrayscale(img,numWorkers)
 
 	// Convert the grayscale image to a 2D float64 array
-	imageData := imageToFloat64ArrayParallel(img,numWorkers)
+	imageData := imageToFloat64Array(img,numWorkers)
 
-	// Define the Sobel filter
-	sobelX := [][]float64{
-		{-1, 0, 1},
-		{-2, 0, 2},
-		{-1, 0, 1},
-	}
-
-	sobelY := [][]float64{
-		{-1, -2, -1},
-		{0, 0, 0},
-		{1, 2, 1},
-	}
 	
 	// Perform convolution for both X and Y directions using goroutines
 	gradientX := convolveParallel(imageData, sobelX, numWorkers)
@@ -152,54 +153,23 @@ func main() {
 
 	//startTime := time.Now()
 	// Combine the results to get the final edge-detected image
-	edges := make([][]float64, len(gradientX))
-	for i := range edges {
-		edges[i] = make([]float64, len(gradientX[0]))
-	}
+	edges := combineAndNormalize(gradientX, gradientY)
 
-	for i := 0; i < len(gradientX); i++ {
-		for j := 0; j < len(gradientX[0]); j++ {
-			edges[i][j] = math.Sqrt(gradientX[i][j]*gradientX[i][j] + gradientY[i][j]*gradientY[i][j])
-		}
-	}
-
-	// Normalize the pixel values to the range [0, 255]
-	minValue := edges[0][0]
-	maxValue := edges[0][0]
-	for i := 0; i < len(edges); i++ {
-		for j := 0; j < len(edges[0]); j++ {
-			if edges[i][j] < minValue {
-				minValue = edges[i][j]
-			}
-			if edges[i][j] > maxValue {
-				maxValue = edges[i][j]
-			}
-		}
-	}
-
-	for i := 0; i < len(edges); i++ {
-		for j := 0; j < len(edges[0]); j++ {
-			edges[i][j] = 255 * (edges[i][j] - minValue) / (maxValue - minValue)
-		}
-	}
 	//endTime := time.Now()
 
 	// Convert the 2D float64 array back to a grayscale image
-	edgeImg := float64ArrayToImageParallel(edges,numWorkers)
+	edgeImg := float64ArrayToImage(edges,numWorkers)
 
 
 	//Save the edge detected image 
-	if err := saveImage("edge_detected_image.jpg", edgeImg); err != nil {
-		fmt.Println("Error saving edge-detected image:", err)
-		return
-	}
+	saveImage("edge_detected_image.jpg", edgeImg)
 
 	endTime := time.Now()
 	fmt.Printf("Duration with goroutines: %s\n", endTime.Sub(startTime))
 }
 
 
-// convertToGrayscale converts a color image to grayscale using goroutines
+//convertToGrayscale converts a color image to grayscale using goroutines
 func convertToGrayscale(img image.Image, numWorkers int) *image.Gray {
 	bounds := img.Bounds()
 	gray := image.NewGray(bounds)
@@ -210,6 +180,10 @@ func convertToGrayscale(img image.Image, numWorkers int) *image.Gray {
 	for workerID := 0; workerID < numWorkers; workerID++ {
 		startRow := bounds.Min.Y + workerID*rowsPerWorker
 		endRow := startRow + rowsPerWorker
+		if workerID == numWorkers-1 {
+			// Ensure that the last worker processes remaining rows
+			endRow = bounds.Max.Y
+		}
 
 		wg.Add(1)
 		go func(startRow, endRow int) {
@@ -230,7 +204,8 @@ func convertToGrayscale(img image.Image, numWorkers int) *image.Gray {
 
 
 // imageToFloat64Array converts an image to a 2D float64 array using goroutines
-func imageToFloat64ArrayParallel(img image.Image, numWorkers int) [][]float64 {
+
+func imageToFloat64Array(img image.Image, numWorkers int) [][]float64 {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
@@ -268,8 +243,7 @@ func imageToFloat64ArrayParallel(img image.Image, numWorkers int) [][]float64 {
 	return imageData
 }
 
-
-func float64ArrayToImageParallel(data [][]float64, numWorkers int) *image.Gray {
+func float64ArrayToImage(data [][]float64, numWorkers int) *image.Gray {
 	height := len(data)
 	width := len(data[0])
 
@@ -277,6 +251,7 @@ func float64ArrayToImageParallel(data [][]float64, numWorkers int) *image.Gray {
 	var wg sync.WaitGroup
 
 	rowsPerWorker := height / numWorkers
+
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -302,18 +277,54 @@ func float64ArrayToImageParallel(data [][]float64, numWorkers int) *image.Gray {
 	return gray
 }
 
+
+func combineAndNormalize(gradientX, gradientY [][]float64) [][]float64{
+
+	edges := make([][]float64, len(gradientX))
+	for i := range edges {
+		edges[i] = make([]float64, len(gradientX[0]))
+	}
+
+	for i := 0; i < len(gradientX); i++ {
+		for j := 0; j < len(gradientX[0]); j++ {
+			edges[i][j] = math.Sqrt(gradientX[i][j]*gradientX[i][j] + gradientY[i][j]*gradientY[i][j])
+		}
+	}
+
+	// Normalize the pixel values to the range [0, 255]
+	minValue := edges[0][0]
+	maxValue := edges[0][0]
+	for i := 0; i < len(edges); i++ {
+		for j := 0; j < len(edges[0]); j++ {
+			if edges[i][j] < minValue {
+				minValue = edges[i][j]
+			}
+			if edges[i][j] > maxValue {
+				maxValue = edges[i][j]
+			}
+		}
+	}
+
+	for i := 0; i < len(edges); i++ {
+		for j := 0; j < len(edges[0]); j++ {
+			edges[i][j] = 255 * (edges[i][j] - minValue) / (maxValue - minValue)
+		}
+	}
+
+	return edges
+}
+
+
 // saveImage saves an image to file
-func saveImage(filename string, img image.Image) error {
+func saveImage(filename string, img image.Image) {
 	file, err := os.Create(filename)
 	if err != nil {
-		return err
+		log.Fatal("Error saving image:", err)
 	}
 	defer file.Close()
 
 	err = jpeg.Encode(file, img, nil)
 	if err != nil {
-		return err
+		log.Fatal("Error encoding image:", err)
 	}
-
-	return nil
 }
